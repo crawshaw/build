@@ -50,6 +50,7 @@ type Corpus struct {
 	github             *GitHub
 	gerrit             *Gerrit
 	watchedGithubRepos []watchedGithubRepo
+	watchedGithubOrgs  []watchedGithubOrg
 	watchedGerritRepos []watchedGerritRepo
 	githubLimiter      *rate.Limiter
 
@@ -353,6 +354,9 @@ func (c *Corpus) processMutationLocked(m *maintpb.Mutation) {
 	if gm := m.Github; gm != nil {
 		c.processGithubMutation(gm)
 	}
+	if gm := m.GithubProject; gm != nil {
+		c.processGithubProjectMutation(gm)
+	}
 	if gm := m.Git; gm != nil {
 		c.processGitMutation(gm)
 	}
@@ -398,6 +402,22 @@ func (c *Corpus) sync(ctx context.Context, loop bool) error {
 					continue
 				}
 				log.Printf("github sync ending for %v: %v", gr.ID(), err)
+				return err
+			}
+		})
+	}
+	for _, w := range c.watchedGithubOrgs {
+		gorg, token := w.gorg, w.token
+		group.Go(func() error {
+			log.Printf("Polling org %v ...", gorg.orgName)
+			for {
+				err := gorg.sync(ctx, token, loop)
+				if loop && isTempErr(err) {
+					log.Printf("Temporary error from github org %v: %v", gorg.orgName, err)
+					time.Sleep(30 * time.Second)
+					continue
+				}
+				log.Printf("github org sync ending for %v: %v", gorg.orgName, err)
 				return err
 			}
 		})

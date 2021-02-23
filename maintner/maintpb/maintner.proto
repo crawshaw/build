@@ -14,6 +14,7 @@ option go_package = "golang.org/x/build/maintner/maintpb";
 message Mutation {
   GithubIssueMutation github_issue = 1; // issue-specific changes
   GithubMutation github = 3; // labels, milestones (not issue-specific)
+  GithubProjectMutation github_project = 5;
 
   GitMutation git = 2;
   GerritMutation gerrit = 4;
@@ -112,6 +113,56 @@ message GithubMilestone {
   string title = 2;
   BoolChange closed = 3;
   int64 number = 4;
+}
+
+// Represents a change to a Github Project.
+message GithubProjectMutation {
+  GithubProject project = 1;
+  GithubProjectColumn column = 2;
+  GithubProjectCard card = 3;
+}
+
+// See https://docs.github.com/en/rest/reference/projects#get-a-project.
+message GithubProject {
+  int64 id = 1; // required, global project ID
+  string owner = 2; // "golang"
+  int64 number = 3; // org-specific, i.e. http://github.com/orgs/<org>/projects/<number>
+  string name = 4;
+  string body = 5;
+  string state = 6;
+  google.protobuf.Timestamp created = 7;
+  google.protobuf.Timestamp updated = 8;
+}
+
+// See https://docs.github.com/en/rest/reference/projects#get-a-project-column.
+message GithubProjectColumn {
+  int64 id = 1; // required, global column ID
+  int64 project_id = 2; // global project ID
+  string owner = 3; // "golang"
+  string name = 4;
+  int64 position = 5; // order in array from https://api.github.com/projects/<i>/columns
+  google.protobuf.Timestamp created = 6;
+  google.protobuf.Timestamp updated = 7;
+}
+
+// Typically either note or content_url is set.
+// See https://docs.github.com/en/rest/reference/projects#get-a-project-card.
+message GithubProjectCard {
+  int64 id = 1; // required, global card ID
+  int64 project_id = 2; // global project ID
+  string owner = 3; // project owner
+  int64 column_id = 11; // global column ID
+
+  // In practice, either note is set or all three of issue_{owner,repo,number}.
+  string note = 4;
+  string issue_owner = 5;
+  string issue_repo = 6;
+  int64 issue_number = 7;
+  int64 position = 12; // order in array from https://api.github.com/columns/<i>/cards
+
+  bool archived = 8;
+  google.protobuf.Timestamp created = 9;
+  google.protobuf.Timestamp updated = 10;
 }
 
 // See https://developer.github.com/v3/activity/events/types/#issuesevent

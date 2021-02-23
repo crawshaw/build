@@ -56,6 +56,7 @@ type GitHub struct {
 	users map[int64]*GitHubUser
 	teams map[int64]*GitHubTeam
 	repos map[GitHubRepoID]*GitHubRepo
+	orgs  map[string]*GitHubOrg
 }
 
 // ForeachRepo calls fn serially for each GitHubRepo, stopping if fn
@@ -78,6 +79,28 @@ func (g *GitHub) ForeachRepo(fn func(*GitHubRepo) error) error {
 		}
 	}
 	return nil
+}
+
+// ForeachOrg calls fn serially for each GitHubOrg, stopping if fn
+// returns an error. The function is called with lexically increasing
+// repo IDs.
+func (g *GitHub) ForeachOrg(fn func(*GitHubOrg) error) error {
+	var names []string
+	for name := range g.orgs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := fn(g.orgs[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Org returns the organization if it's known. Otherwise it returns nil.
+func (g *GitHub) Org(orgName string) *GitHubOrg {
+	return g.orgs[orgName]
 }
 
 // Repo returns the repo if it's known. Otherwise it returns nil.
@@ -104,6 +127,543 @@ func (g *GitHub) getOrCreateRepo(owner, repo string) *GitHubRepo {
 	}
 	g.repos[id] = r
 	return r
+}
+
+func (g *GitHub) getOrCreateOrg(orgName string) *GitHubOrg {
+	if g == nil {
+		panic("cannot call methods on nil GitHub")
+	}
+	gorg, ok := g.orgs[orgName]
+	if ok {
+		return gorg
+	}
+	gorg = &GitHubOrg{
+		github:   g,
+		orgName:  orgName,
+		projects: map[int64]*GitHubProject{},
+	}
+	g.orgs[orgName] = gorg
+	return gorg
+}
+
+type GitHubOrg struct {
+	github   *GitHub
+	orgName  string
+	projects map[int64]*GitHubProject       // global project ID -> project
+	columns  map[int64]*GitHubProjectColumn // global column ID -> column
+	cards    map[int64]*GitHubProjectCard   // global card ID -> card
+}
+
+func (gorg *GitHubOrg) Name() string { return gorg.orgName }
+
+func (gorg *GitHubOrg) ProjectByID(id int64) *GitHubProject { return gorg.projects[id] }
+
+// TODO func (gr *GitHubOrg) Project(n int32) *GitHubProject
+
+// ForeachProject calls fn for each project in the organization.
+func (gr *GitHubOrg) ForeachProject(fn func(*GitHubProject) error) error {
+	s := make([]*GitHubProject, 0, len(gr.projects))
+	for _, p := range gr.projects {
+		s = append(s, p)
+	}
+	sort.Slice(s, func(i, j int) bool { return s[i].Number < s[j].Number })
+	for _, p := range s {
+		if err := fn(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ForeachColumn calls fn for each project column in the organization.
+func (gr *GitHubOrg) ForeachColumn(fn func(*GitHubProjectColumn) error) error {
+	s := make([]*GitHubProjectColumn, 0, len(gr.columns))
+	for _, p := range gr.columns {
+		s = append(s, p)
+	}
+	sort.Slice(s, func(i, j int) bool { return s[i].ID < s[j].ID })
+	for _, p := range s {
+		if err := fn(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ForeachCard calls fn for each project card in the organization.
+func (gr *GitHubOrg) ForeachCard(fn func(*GitHubProjectCard) error) error {
+	s := make([]*GitHubProjectCard, 0, len(gr.cards))
+	for _, p := range gr.cards {
+		s = append(s, p)
+	}
+	sort.Slice(s, func(i, j int) bool { return s[i].ID < s[j].ID })
+	for _, p := range s {
+		if err := fn(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sync checks for new changes on a single GitHub org and
+// updates the Corpus with any changes. If loop is true, it runs
+// forever.
+func (gorg *GitHubOrg) sync(ctx context.Context, token string, loop bool) error {
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	hc := oauth2.NewClient(ctx, ts)
+	if tr, ok := hc.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
+	}
+	directTransport := hc.Transport
+	if gorg.github.c.githubLimiter != nil {
+		directTransport = limitTransport{gorg.github.c.githubLimiter, hc.Transport}
+	}
+	cachingTransport := &httpcache.Transport{
+		Transport:           directTransport,
+		Cache:               &githubCache{Cache: httpcache.NewMemoryCache()},
+		MarkCachedResponses: true, // adds "X-From-Cache: 1" response header.
+	}
+
+	p := &githubOrgPoller{
+		c:             gorg.github.c,
+		token:         token,
+		gorg:          gorg,
+		githubDirect:  github.NewClient(&http.Client{Transport: directTransport}),
+		githubCaching: github.NewClient(&http.Client{Transport: cachingTransport}),
+		client:        http.DefaultClient,
+	}
+	activityCh := gorg.github.c.activityChan("github:" + gorg.orgName)
+	var expectChanges bool // got webhook update, but haven't seen new data yet
+	var sleepDelay time.Duration
+	for {
+		prevLastUpdate := p.lastUpdate
+		err := p.sync(ctx, expectChanges)
+		if err == context.Canceled || !loop {
+			return err
+		}
+		sawChanges := !p.lastUpdate.Equal(prevLastUpdate)
+		if sawChanges {
+			expectChanges = false
+		}
+		// If we got woken up by a webhook, sometimes
+		// immediately polling GitHub for the data results in
+		// a cache hit saying nothing's changed. Don't believe
+		// it. Polling quickly with exponential backoff until
+		// we see what we're expecting.
+		if expectChanges {
+			if sleepDelay == 0 {
+				sleepDelay = 1 * time.Second
+			} else {
+				sleepDelay *= 2
+				if sleepDelay > 15*time.Minute {
+					sleepDelay = 15 * time.Minute
+				}
+			}
+			p.logf("expect changes; re-polling in %v", sleepDelay)
+		} else {
+			sleepDelay = 15 * time.Minute
+		}
+		p.logf("sync = %v; sleeping", err)
+		timer := time.NewTimer(sleepDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-activityCh:
+			timer.Stop()
+			expectChanges = true
+			sleepDelay = 0
+		case <-timer.C:
+		}
+	}
+}
+
+// processGithubProjectMutation updates the corpus with the information in m.
+func (c *Corpus) processGithubProjectMutation(m *maintpb.GithubProjectMutation) {
+	if c == nil {
+		panic("nil corpus")
+	}
+	c.initGithub()
+	var owner string
+	if m.Project != nil {
+		owner = m.Project.Owner
+	}
+	if m.Column != nil {
+		owner = m.Column.Owner
+	}
+	if m.Card != nil {
+		owner = m.Card.Owner
+	}
+	gorg := c.github.getOrCreateOrg(owner)
+	if gorg == nil {
+		log.Printf("bogus owner %q in mutation: %v", owner, m)
+		return
+	}
+	if m.Project != nil {
+		pb := gorg.getOrCreateProject(m.Project.Id)
+		pb.processMutation(*m.Project)
+	}
+	if m.Column != nil {
+		cb := gorg.getOrCreateColumn(m.Column.Id)
+		cb.processMutation(gorg, *m.Column)
+	}
+	if m.Card != nil {
+		cb := gorg.getOrCreateCard(m.Card.Id)
+		cb.processMutation(gorg, *m.Card)
+	}
+}
+
+func (g *GitHubOrg) getOrCreateProject(id int64) *GitHubProject {
+	if id == 0 {
+		panic("zero id")
+	}
+	gprj, ok := g.projects[id]
+	if ok {
+		return gprj
+	}
+	if g.projects == nil {
+		g.projects = map[int64]*GitHubProject{}
+	}
+	gprj = &GitHubProject{ID: id}
+	g.projects[id] = gprj
+	return gprj
+}
+
+func (g *GitHubOrg) getOrCreateColumn(id int64) *GitHubProjectColumn {
+	if id == 0 {
+		panic("zero id")
+	}
+	gcol, ok := g.columns[id]
+	if ok {
+		return gcol
+	}
+	if g.columns == nil {
+		g.columns = map[int64]*GitHubProjectColumn{}
+	}
+	gcol = &GitHubProjectColumn{ID: id}
+	g.columns[id] = gcol
+	return gcol
+}
+
+func (g *GitHubOrg) getOrCreateCard(id int64) *GitHubProjectCard {
+	if id == 0 {
+		panic("zero id")
+	}
+	c, ok := g.cards[id]
+	if ok {
+		return c
+	}
+	if g.cards == nil {
+		g.cards = map[int64]*GitHubProjectCard{}
+	}
+	c = &GitHubProjectCard{ID: id}
+	g.cards[id] = c
+	return c
+}
+
+// A githubOrgPoller updates the Corpus to have the latest
+// version of the GitHub org, using the GitHub client.
+type githubOrgPoller struct {
+	c             *Corpus // shortcut for gorg.github.c
+	gorg          *GitHubOrg
+	token         string
+	lastUpdate    time.Time // modified by sync
+	githubCaching *github.Client
+	githubDirect  *github.Client // not caching
+	client        httpClient     // the client used to poll github
+}
+
+func (p *githubOrgPoller) logf(format string, args ...interface{}) {
+	log.Printf("sync github org "+p.gorg.orgName+": "+format, args...)
+}
+
+func (p *githubOrgPoller) sync(ctx context.Context, expectChanges bool) error {
+	p.logf("Beginning org sync.")
+	if err := p.syncProjects(ctx, expectChanges); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *githubOrgPoller) syncColumnsOnProject(ctx context.Context, orgName string, projectID int64) error {
+	nextPage := 0
+	morePages := true // at least try the first. might be empty.
+	for morePages {
+		cols, res, err := p.githubDirect.Projects.ListProjectColumns(ctx, projectID, &github.ListOptions{
+			Page:    nextPage,
+			PerPage: 100,
+		})
+		if err != nil {
+			if canRetry(ctx, err) {
+				continue
+			}
+			return err
+		}
+
+		for pos, col := range cols {
+			mut := maintpb.GithubProjectColumn{
+				Id:        *col.ID,
+				ProjectId: projectID,
+				Name:      *col.Name,
+				Position:  int64(pos),
+				Owner:     orgName,
+			}
+			var changed bool
+
+			p.c.mu.RLock()
+			{
+				gcol := p.gorg.getOrCreateColumn(*col.ID)
+				changed = diffTimeField(&mut.Created, gcol.Created, col.GetCreatedAt().Time) ||
+					diffTimeField(&mut.Updated, gcol.Updated, col.GetUpdatedAt().Time) ||
+					mut.Name != gcol.Name ||
+					int(mut.Position) != gcol.Position
+			}
+			p.c.mu.RUnlock()
+
+			if !changed {
+				continue
+			}
+
+			p.logf("changed project (id %d) column: %q", projectID, *col.Name)
+			if err := p.syncCardsOnColumn(ctx, mut.Owner, projectID, *col.ID); err != nil {
+				return err
+			}
+			p.c.addMutation(&maintpb.Mutation{
+				GithubProject: &maintpb.GithubProjectMutation{
+					Column: &mut,
+				},
+			})
+		}
+
+		nextPage = res.NextPage
+		if nextPage == 0 {
+			morePages = false
+		}
+	}
+	return nil
+}
+
+func (p *githubOrgPoller) syncCardsOnColumn(ctx context.Context, projectOwner string, projectID, columnID int64) error {
+	nextPage := 0
+	morePages := true // at least try the first. might be empty.
+	for morePages {
+		all := "all"
+		cards, res, err := p.githubDirect.Projects.ListProjectCards(ctx, columnID, &github.ProjectCardListOptions{
+			ArchivedState: &all,
+			ListOptions: github.ListOptions{
+				Page:    nextPage,
+				PerPage: 100,
+			},
+		})
+		if err != nil {
+			if canRetry(ctx, err) {
+				continue
+			}
+			return err
+		}
+
+		for pos, card := range cards {
+			mut := maintpb.GithubProjectCard{
+				Id:        *card.ID,
+				Owner:     projectOwner,
+				ProjectId: projectID,
+				Position:  int64(pos),
+			}
+			if card.Note != nil {
+				mut.Note = *card.Note
+			}
+			if card.Archived != nil {
+				mut.Archived = *card.Archived
+			}
+			if card.ContentURL != nil && *card.ContentURL != "" {
+				contentURL, err := url.Parse(*card.ContentURL)
+				if err != nil {
+					return err
+				}
+				parts := strings.Split(strings.TrimPrefix(contentURL.Path, "/"), "/")
+				if len(parts) != 5 || parts[0] != "repos" || parts[3] != "issues" {
+					return fmt.Errorf("contentURL is missing parts: %q: %v", *card.ContentURL, parts)
+				}
+				mut.IssueOwner = parts[1]
+				mut.IssueRepo = parts[2]
+				issueNum, err := strconv.Atoi(parts[4])
+				if err != nil {
+					return fmt.Errorf("contentURL has bad issue num: %q: %v", *card.ContentURL, err)
+				}
+				mut.IssueNumber = int64(issueNum)
+			}
+			if card.ColumnURL != nil && *card.ColumnURL != "" {
+				columnURL, err := url.Parse(*card.ColumnURL)
+				if err != nil {
+					return err
+				}
+				col := strings.TrimPrefix(columnURL.Path, "/projects/columns/")
+				colID, err := strconv.ParseInt(col, 10, 64)
+				if err != nil {
+					return fmt.Errorf("columnURL has bad column ID: %q: %v", *card.ColumnURL, err)
+				}
+				mut.ColumnId = colID
+			}
+
+			var changed bool
+
+			p.c.mu.RLock()
+			{
+				gcard := p.gorg.getOrCreateCard(*card.ID)
+				changed = diffTimeField(&mut.Created, gcard.Created, card.GetCreatedAt().Time) ||
+					diffTimeField(&mut.Updated, gcard.Updated, card.GetUpdatedAt().Time) ||
+					mut.Note != gcard.Note ||
+					mut.Archived != gcard.Archived ||
+					int(mut.Position) != gcard.Position
+			}
+			p.c.mu.RUnlock()
+
+			if changed {
+				p.c.addMutation(&maintpb.Mutation{
+					GithubProject: &maintpb.GithubProjectMutation{Card: &mut},
+				})
+			}
+		}
+
+		nextPage = res.NextPage
+		if nextPage == 0 {
+			morePages = false
+		}
+	}
+	return nil
+}
+
+func (p *githubOrgPoller) projectIDsWithStaleColumSync() (projectIDs []int64) {
+	p.c.mu.RLock()
+	defer p.c.mu.RUnlock()
+
+	log.Printf("projectIDsWithStaleColumSync: p.gorg=%p, len(p.gorg.projects)=%d", p.gorg, len(p.gorg.projects))
+	for _, gprj := range p.gorg.projects {
+		// TODO if !gprj.columnsSynced()
+		projectIDs = append(projectIDs, gprj.ID)
+	}
+	sort.Slice(projectIDs, func(i, j int) bool { return projectIDs[i] < projectIDs[j] })
+	return projectIDs
+}
+
+func (p *githubOrgPoller) syncProjects(ctx context.Context, expectChanges bool) error {
+	page := 1
+	seen := make(map[int64]bool)
+	keepGoing := true
+	org := p.gorg.orgName
+	for keepGoing {
+		ghc := p.githubCaching
+		if expectChanges {
+			ghc = p.githubDirect
+		}
+		projects, res, err := ghc.Organizations.ListProjects(ctx, org, &github.ProjectListOptions{
+			State: "all",
+			ListOptions: github.ListOptions{
+				Page:    page,
+				PerPage: 100,
+			},
+		})
+		if err != nil {
+			if canRetry(ctx, err) {
+				continue
+			}
+			return err
+		}
+		// See https://developer.github.com/v3/activity/events/ for X-Poll-Interval:
+		if pi := res.Response.Header.Get("X-Poll-Interval"); pi != "" {
+			nsec, _ := strconv.Atoi(pi)
+			d := time.Duration(nsec) * time.Second
+			p.logf("Requested to adjust poll interval to %v", d)
+			// TODO: return an error type up that the sync loop can use
+			// to adjust its default interval.
+			// For now, ignore.
+		}
+		fromCache := res.Response.Header.Get(xFromCache) == "1"
+		if len(projects) == 0 {
+			p.logf("projects: reached end.")
+			break
+		}
+
+		changes := 0
+		for _, prj := range projects {
+			id := prj.GetID()
+			if seen[id] {
+				// If an issue gets updated (and bumped to the top) while we
+				// are paging, it's possible the last issue from page N can
+				// appear as the first issue on page N+1. Don't process that
+				// issue twice.
+				// https://github.com/google/go-github/issues/566
+				continue
+			}
+			seen[id] = true
+
+			var mp *maintpb.Mutation
+			var why string
+			p.c.mu.RLock()
+			{
+				gp := p.gorg.projects[id]
+				mp, why = newMutationFromProject(gp, prj)
+			}
+			p.c.mu.RUnlock()
+
+			if mp == nil {
+				continue
+			}
+
+			p.logf("changed project %d (id:%d), why: %q", prj.GetNumber(), id, why)
+
+			// The project has changed. Sync its columns before saving the mutation
+			// with the new Updated time.
+			if err := p.syncColumnsOnProject(ctx, mp.GithubProject.Project.Owner, id); err != nil {
+				p.logf("column sync on project %d: %v", id, err)
+				return err
+			}
+
+			changes++
+			p.c.addMutation(mp)
+			p.lastUpdate = time.Now()
+		}
+
+		p.logf("After page %d: %v projects, %v changes, cached=%v", page, len(projects), changes, fromCache)
+		page++
+	}
+
+	return nil
+}
+
+func newMutationFromProject(a *GitHubProject, b *github.Project) (_ *maintpb.Mutation, why string) {
+	if b == nil || b.Number == nil {
+		panic(fmt.Sprintf("github issue with nil number: %#v", b))
+	}
+	owner := b.GetOwnerURL()
+	owner = strings.TrimPrefix(owner, "https://api.github.com/orgs/")
+	m := &maintpb.GithubProjectMutation{
+		Project: &maintpb.GithubProject{
+			Id:     b.GetID(),
+			Number: int64(b.GetNumber()),
+			Name:   b.GetName(),
+			Body:   b.GetBody(),
+			Owner:  owner,
+		},
+	}
+	if diffTimeField(&m.Project.Created, a.getCreatedAt(), b.GetCreatedAt().Time) {
+		log.Printf("a.getCreatedAt()=%v, b.GetCreatedAt().Time=%v", a.getCreatedAt(), b.GetCreatedAt().Time)
+		why = "created"
+	}
+	if diffTimeField(&m.Project.Updated, a.getUpdatedAt(), b.GetUpdatedAt().Time) && why == "" {
+		log.Printf("a.getUpdatedAt()=%v, b.GetUpdatedAt().Time=%v", a.getUpdatedAt(), b.GetUpdatedAt().Time)
+		why = "updated"
+	}
+	if why == "" && m.Project.Name != a.Name {
+		why = "name"
+	}
+	if why == "" && m.Project.Body != a.Body {
+		why = "body"
+	}
+	if why == "" {
+		return nil, ""
+	}
+	return &maintpb.Mutation{GithubProject: m}, why
 }
 
 type GitHubRepo struct {
@@ -248,6 +808,179 @@ type GitHubIssueRef struct {
 }
 
 func (r GitHubIssueRef) String() string { return fmt.Sprintf("%s#%d", r.Repo.ID(), r.Number) }
+
+// GitHubProject represents a GitHub project.
+type GitHubProject struct {
+	ID      int64  // globally unique
+	Owner   string // "golang"
+	Number  int32
+	Name    string
+	Body    string
+	State   string
+	Created time.Time
+	Updated time.Time
+
+	columns map[int64]*GitHubProjectColumn // global column ID -> column
+}
+
+// Columns returns the current columns of the project in positional order.
+func (prj *GitHubProject) Columns() (res []*GitHubProjectColumn) {
+	for _, col := range prj.columns {
+		res = append(res, col)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Position < res[j].Position })
+	return res
+}
+
+func (prj *GitHubProject) processMutation(mut maintpb.GithubProject) {
+	if prj.ID == 0 {
+		panic("bogus label ID 0")
+	}
+	if prj.ID != mut.Id {
+		panic(fmt.Sprintf("project ID = %v != mutation ID = %v", prj.ID, mut.Id))
+	}
+	if mut.Owner != "" {
+		prj.Owner = mut.Owner
+	}
+	if mut.Number != 0 {
+		prj.Number = int32(mut.Number)
+	}
+	if mut.Name != "" {
+		prj.Name = mut.Name
+	}
+	if mut.Body != "" {
+		prj.Body = mut.Body
+	}
+	if mut.State != "" {
+		prj.State = mut.State
+	}
+	if t := mut.GetCreated(); t != nil {
+		prj.Created = t.AsTime()
+	}
+	if t := mut.GetUpdated(); t != nil {
+		prj.Updated = t.AsTime()
+	}
+}
+
+func (prj *GitHubProject) getCreatedAt() time.Time {
+	if prj == nil {
+		return time.Time{}
+	}
+	return prj.Created
+}
+
+func (prj *GitHubProject) getUpdatedAt() time.Time {
+	if prj == nil {
+		return time.Time{}
+	}
+	return prj.Updated
+}
+
+// GitHubProjectColumn represents a GitHub project column.
+type GitHubProjectColumn struct {
+	ID        int64 // globally unique
+	ProjectID int64 // global ID
+	Name      string
+	Position  int
+	Created   time.Time
+	Updated   time.Time
+
+	cards map[int64]*GitHubProjectCard // global card ID -> card
+}
+
+func (col *GitHubProjectColumn) Cards() (cards []*GitHubProjectCard) {
+	for _, card := range col.cards {
+		cards = append(cards, card)
+	}
+	sort.Slice(cards, func(i, j int) bool { return cards[i].Position < cards[j].Position })
+	return cards
+}
+
+func (col *GitHubProjectColumn) processMutation(gorg *GitHubOrg, mut maintpb.GithubProjectColumn) {
+	if col.ID == 0 {
+		panic("bogus column ID 0")
+	}
+	if col.ID != mut.Id {
+		panic(fmt.Sprintf("project column ID = %v != mutation ID = %v", col.ID, mut.Id))
+	}
+	if mut.ProjectId != 0 {
+		col.ProjectID = mut.ProjectId
+		prj := gorg.getOrCreateProject(col.ProjectID)
+		if prj.columns == nil {
+			prj.columns = map[int64]*GitHubProjectColumn{}
+		}
+		prj.columns[col.ID] = col
+	}
+	if mut.Name != "" {
+		col.Name = mut.Name
+	}
+	if mut.Position != 0 {
+		col.Position = int(mut.Position)
+	}
+	if t := mut.GetCreated().AsTime(); !t.IsZero() {
+		col.Created = t
+	}
+	if t := mut.GetUpdated().AsTime(); !t.IsZero() {
+		col.Updated = t
+	}
+}
+
+// GitHubProjectCard represents a GitHub project card.
+type GitHubProjectCard struct {
+	ID          int64 // globally unique
+	ProjectID   int64 // global ID
+	ColumnID    int64 // global ID
+	Note        string
+	IssueOwner  string
+	IssueRepo   string
+	IssueNumber int32
+	Archived    bool
+	Position    int
+	Created     time.Time
+	Updated     time.Time
+}
+
+func (c *GitHubProjectCard) processMutation(gorg *GitHubOrg, mut maintpb.GithubProjectCard) {
+	if c.ID == 0 {
+		panic("bogus cardID 0")
+	}
+	if c.ID != mut.Id {
+		panic(fmt.Sprintf("project card ID = %v != mutation ID = %v", c.ID, mut.Id))
+	}
+	if mut.ProjectId != 0 {
+		c.ProjectID = mut.ProjectId
+	}
+	if mut.ColumnId != 0 {
+		c.ColumnID = mut.ColumnId
+		col := gorg.getOrCreateColumn(c.ColumnID)
+		if col.cards == nil {
+			col.cards = map[int64]*GitHubProjectCard{}
+		}
+		col.cards[c.ID] = c
+	}
+	if mut.Note != "" {
+		c.Note = mut.Note
+	}
+	if mut.IssueOwner != "" {
+		c.IssueOwner = mut.IssueOwner
+	}
+	if mut.IssueRepo != "" {
+		c.IssueRepo = mut.IssueRepo
+	}
+	if mut.IssueNumber != 0 {
+		c.IssueNumber = int32(mut.IssueNumber)
+	}
+	c.Archived = mut.Archived
+	if mut.Position != 0 {
+		c.Position = int(mut.Position)
+	}
+	if t := mut.GetCreated().AsTime(); !t.IsZero() {
+		c.Created = t
+	}
+	if t := mut.GetUpdated().AsTime(); !t.IsZero() {
+		c.Updated = t
+	}
+}
 
 // GitHubIssue represents a GitHub issue.
 // This is maintner's in-memory representation. It differs slightly
@@ -764,6 +1497,7 @@ func (c *Corpus) initGithub() {
 	c.github = &GitHub{
 		c:     c,
 		repos: map[GitHubRepoID]*GitHubRepo{},
+		orgs:  map[string]*GitHubOrg{},
 	}
 }
 
@@ -795,8 +1529,34 @@ func (c *Corpus) TrackGitHub(owner, repo, token string) {
 	})
 }
 
+// TrackGitHubOrg registers the named GitHub org to
+// watch and append to the mutation log. Only valid in leader mode.
+// The token is the auth token to use to make API calls.
+func (c *Corpus) TrackGitHubOrg(org, token string) {
+	if c.mutationLogger == nil {
+		panic("can't TrackGitHub in non-leader mode")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.initGithub()
+	gorg := c.github.getOrCreateOrg(org)
+	if gorg == nil {
+		log.Fatalf("invalid github org %q", org)
+	}
+	c.watchedGithubOrgs = append(c.watchedGithubOrgs, watchedGithubOrg{
+		gorg:  gorg,
+		token: token,
+	})
+}
+
 type watchedGithubRepo struct {
 	gr    *GitHubRepo
+	token string
+}
+
+type watchedGithubOrg struct {
+	gorg  *GitHubOrg
 	token string
 }
 
@@ -1032,18 +1792,18 @@ var issueDiffMethods = []func(githubIssueDiffer, *maintpb.GithubIssueMutation) b
 }
 
 func (d githubIssueDiffer) diffCreatedAt(m *maintpb.GithubIssueMutation) bool {
-	return d.diffTimeField(&m.Created, d.a.getCreatedAt(), d.b.GetCreatedAt())
+	return diffTimeField(&m.Created, d.a.getCreatedAt(), d.b.GetCreatedAt())
 }
 
 func (d githubIssueDiffer) diffUpdatedAt(m *maintpb.GithubIssueMutation) bool {
-	return d.diffTimeField(&m.Updated, d.a.getUpdatedAt(), d.b.GetUpdatedAt())
+	return diffTimeField(&m.Updated, d.a.getUpdatedAt(), d.b.GetUpdatedAt())
 }
 
 func (d githubIssueDiffer) diffClosedAt(m *maintpb.GithubIssueMutation) bool {
-	return d.diffTimeField(&m.ClosedAt, d.a.getClosedAt(), d.b.GetClosedAt())
+	return diffTimeField(&m.ClosedAt, d.a.getClosedAt(), d.b.GetClosedAt())
 }
 
-func (d githubIssueDiffer) diffTimeField(dst **timestamp.Timestamp, memTime, githubTime time.Time) bool {
+func diffTimeField(dst **timestamp.Timestamp, memTime, githubTime time.Time) bool {
 	if githubTime.IsZero() || memTime.Equal(githubTime) {
 		return false
 	}

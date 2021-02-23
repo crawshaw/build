@@ -53,6 +53,7 @@ var (
 	verbose         = flag.Bool("verbose", false, "enable verbose debug output")
 	genMut          = flag.Bool("generate-mutations", true, "whether this instance should read from upstream git/gerrit/github and generate new mutations to the end of the log. This requires network access and only one instance can be generating mutation")
 	watchGithub     = flag.String("watch-github", "", "Comma-separated list of owner/repo pairs to slurp")
+	watchGithubOrg  = flag.String("watch-github-org", "", "Comma-separated list of organization pairs to slurp")
 	watchGerrit     = flag.String("watch-gerrit", "", `Comma-separated list of Gerrit projects to watch, each of form "hostname/project" (e.g. "go.googlesource.com/go")`)
 	pubsub          = flag.String("pubsub", "", "If non-empty, the golang.org/x/build/cmd/pubsubhelper URL scheme and hostname, without path")
 	config          = flag.String("config", "", "If non-empty, the name of a pre-defined config. Valid options are 'go' to be the primary Go server; 'godata' to run the server locally using the godata package, and 'devgo' to act like 'go', but mirror from godata at start-up.")
@@ -185,11 +186,11 @@ func main() {
 	}
 	corpus.SetVerbose(*verbose)
 
+	if *githubRateLimit > 0 && (*watchGithub != "" || *watchGithubOrg != "") {
+		limit := rate.Every(time.Second / time.Duration(*githubRateLimit))
+		corpus.SetGitHubLimiter(rate.NewLimiter(limit, *githubRateLimit))
+	}
 	if *watchGithub != "" {
-		if *githubRateLimit > 0 {
-			limit := rate.Every(time.Second / time.Duration(*githubRateLimit))
-			corpus.SetGitHubLimiter(rate.NewLimiter(limit, *githubRateLimit))
-		}
 		for _, pair := range strings.Split(*watchGithub, ",") {
 			splits := strings.SplitN(pair, "/", 2)
 			if len(splits) != 2 || splits[1] == "" {
@@ -200,6 +201,15 @@ func main() {
 				log.Fatalf("getting github token: %v", err)
 			}
 			corpus.TrackGitHub(splits[0], splits[1], token)
+		}
+	}
+	if *watchGithubOrg != "" {
+		for _, orgName := range strings.Split(*watchGithubOrg, ",") {
+			token, err := getGithubToken(ctx)
+			if err != nil {
+				log.Fatalf("getting github token: %v", err)
+			}
+			corpus.TrackGitHubOrg(orgName, token)
 		}
 	}
 	if *watchGerrit != "" {
