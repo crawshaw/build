@@ -16,8 +16,8 @@ require (
 	github.com/davecgh/go-spew v1.1.1
 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
 	github.com/gliderlabs/ssh v0.1.1
-	github.com/golang/protobuf v1.3.4
-	github.com/google/go-cmp v0.4.0
+	github.com/golang/protobuf v1.4.1
+	github.com/google/go-cmp v0.5.0
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/google/uuid v1.1.2
@@ -37,8 +37,9 @@ require (
 	golang.org/x/text v0.3.2
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	google.golang.org/api v0.20.0
-	google.golang.org/genproto v0.0.0-20200305110556-506484158171
+	google.golang.org/genproto v0.0.0-20200526211855-cb27e3aa2013
 	google.golang.org/grpc v1.27.1
+	google.golang.org/protobuf v1.25.0
 	gopkg.in/inf.v0 v0.9.1
 	grpc.go4.org v0.0.0-20170609214715-11d0a25b4919
 )
